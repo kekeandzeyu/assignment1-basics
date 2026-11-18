@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import os
 from collections import Counter, defaultdict
 from multiprocessing import Pool
@@ -100,9 +101,12 @@ def _count_pretokens(
         with open(input_path, encoding="utf-8", errors="ignore") as f:
             return _pretokenize_text(f.read(), special_tokens)
 
+    # Use many more chunks than processes (~64 MB each) so that each worker only ever
+    # holds a small piece of the file in memory, instead of 1/num_processes of it.
+    num_chunks = max(num_processes, file_size // (64 * 1024 * 1024))
     split_token = special_tokens[0].encode("utf-8")
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_processes, split_token)
+        boundaries = find_chunk_boundaries(f, num_chunks, split_token)
 
     tasks = [
         (os.fspath(input_path), start, end, special_tokens)
@@ -112,9 +116,24 @@ def _count_pretokens(
 
     total_counts: Counter[tuple[int, ...]] = Counter()
     with Pool(processes=min(num_processes, len(tasks))) as pool:
-        for chunk_counts in pool.map(_pretokenize_chunk, tasks):
+        for chunk_counts in pool.imap_unordered(_pretokenize_chunk, tasks):
             total_counts.update(chunk_counts)
     return total_counts
+
+
+class _Desc:
+    """Wraps a (bytes, bytes) pair so that a min-heap pops the lexicographically GREATEST pair first."""
+
+    __slots__ = ("key",)
+
+    def __init__(self, key: tuple[bytes, bytes]):
+        self.key = key
+
+    def __lt__(self, other: _Desc) -> bool:
+        return self.key > other.key
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Desc) and self.key == other.key
 
 
 def train_bpe(
@@ -170,18 +189,27 @@ def train_bpe(
             pair_counts[pair] += freq
             pair_to_words[pair].add(w_idx)
 
-    # 3. Compute BPE merges iteratively with incremental pair-count updates
+    # 3. Compute BPE merges iteratively with incremental pair-count updates.
+    #
+    # Finding the best pair with max() over all pairs costs O(#pairs) per merge. Instead we keep
+    # a heap ordered by (highest count, then lexicographically greatest bytes) -- the same rule
+    # as max(). Entries are never updated in place: when a count changes we push a fresh entry,
+    # and when popping we skip "stale" entries whose count no longer matches pair_counts.
+    def heap_entry(p: tuple[int, int]) -> tuple[int, _Desc, tuple[int, int]]:
+        return (-pair_counts[p], _Desc((vocab[p[0]], vocab[p[1]])), p)
+
+    heap = [heap_entry(p) for p in pair_counts]
+    heapq.heapify(heap)
+
     merges: list[tuple[bytes, bytes]] = []
     for _ in range(num_merges):
-        if not pair_counts:
-            break
-
-        # Break frequency ties deterministically by choosing the lexicographically greater byte pair
-        best_pair = max(
-            pair_counts,
-            key=lambda p: (pair_counts[p], vocab[p[0]], vocab[p[1]]),
-        )
-        if pair_counts[best_pair] <= 0:
+        best_pair = None
+        while heap:
+            neg_count, _, p = heapq.heappop(heap)
+            if pair_counts.get(p) == -neg_count:  # entry is up to date
+                best_pair = p
+                break
+        if best_pair is None:
             break
 
         p0, p1 = best_pair
@@ -190,6 +218,7 @@ def train_bpe(
         merges.append((vocab[p0], vocab[p1]))
 
         affected_words = list(pair_to_words.pop(best_pair, ()))
+        changed: set[tuple[int, int]] = set()
         for w_idx in affected_words:
             word = words[w_idx]
             freq = freqs[w_idx]
@@ -230,5 +259,12 @@ def train_bpe(
                         del pair_to_words[p]
             for p in new_pairs - old_pairs:
                 pair_to_words[p].add(w_idx)
+            changed |= old_pairs
+            changed |= new_pairs
+
+        # Push the new counts of every pair touched by this merge (old heap entries become stale).
+        for p in changed:
+            if p in pair_counts:
+                heapq.heappush(heap, heap_entry(p))
 
     return vocab, merges
